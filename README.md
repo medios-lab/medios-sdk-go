@@ -199,6 +199,14 @@ go run ./examples/summer -controller http://127.0.0.1:5150 -user <node-user> \
    accept nor decline stays outstanding to your framework and starves the
    others on the cluster. `examples/reference` implements the full lifecycle;
    it mirrors Marathon's offer-revive behavior.
+6. **Controller failover.** With more than one controller, pass every URL as
+   one comma-separated string:
+   `NewClient("http://ctl-a:5150,http://ctl-b:5150", ...)`. `Subscribe` finds
+   the leader, following a standby's redirect and skipping a controller that
+   is down or has no leader yet. When the stream ends, call `Subscribe` again
+   on the same client: it resubscribes as the same framework, and with
+   `WithFailoverTimeout` the framework's tasks keep running. Then call
+   `Reconcile` to re-learn task state.
 
 ## Design
 
