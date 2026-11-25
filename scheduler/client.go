@@ -398,7 +398,8 @@ func (c *Client) Subscribe(ctx context.Context) (<-chan medios.Event, <-chan err
 // other status, or the transport error, each prefixed with the URL tried.
 //
 // Each hop gets its own context, cancelled when handshakeTimeout passes
-// before the response headers arrive. The caller's context is left alone, so
+// before the response headers arrive, or again before the body of a response
+// other than 200 or a redirect is read. The caller's context is left alone, so
 // Subscribe can still try the next controller. On a 200 the hop's context
 // lives until the response body is closed.
 func (c *Client) subscribeFollowing(ctx context.Context, endpoint string, body []byte) (*http.Response, error) {
@@ -431,10 +432,21 @@ func (c *Client) subscribeFollowing(ctx context.Context, endpoint string, body [
 			resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
 			return resp, nil
 		}
-		b, _ := io.ReadAll(resp.Body)
+		// The status and Location header decide what happens next. A
+		// redirect's body is not read. Any other body is only detail for the
+		// error, read under a second handshakeTimeout so a controller that
+		// stalls or cuts it short still gets its status acted on.
+		var b []byte
+		loc := resp.Header.Get("Location")
+		redirect := resp.StatusCode == http.StatusTemporaryRedirect && loc != ""
+		if !redirect {
+			bodyTimer := time.AfterFunc(c.handshakeTimeout, cancel)
+			b, _ = io.ReadAll(resp.Body)
+			bodyTimer.Stop()
+		}
 		_ = resp.Body.Close()
 		cancel()
-		if loc := resp.Header.Get("Location"); resp.StatusCode == http.StatusTemporaryRedirect && loc != "" {
+		if redirect {
 			next, err := resp.Request.URL.Parse(loc)
 			if err != nil {
 				return nil, fmt.Errorf("%s: bad redirect Location %q: %w", endpoint, loc, err)

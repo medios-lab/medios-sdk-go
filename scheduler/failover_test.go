@@ -202,3 +202,55 @@ func TestClient_SubscribeNamesControllerThatNeverAnswers(t *testing.T) {
 		t.Fatalf("error does not name the stalled controller: %v", err)
 	}
 }
+
+// newBodyStalled answers every request with the given status and headers,
+// then leaves the response body open.
+func newBodyStalled(t *testing.T, status int, location string) *httptest.Server {
+	release := make(chan struct{})
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if location != "" {
+			w.Header().Set("Location", location)
+		}
+		w.Header().Set("Content-Length", "10")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte("x"))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		s.Close()
+	})
+	return s
+}
+
+func subscribedWithin(t *testing.T, fc *fakeController, urls string) {
+	t.Helper()
+	client, err := NewClient(urls, "test-fw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.handshakeTimeout = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	events, _, err := client.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	subscribed(t, fc, events, "fw-001")
+}
+
+func TestClient_SubscribeSkipsControllerWhose503BodyStalls(t *testing.T) {
+	stalled := newBodyStalled(t, http.StatusServiceUnavailable, "")
+	fc := newFakeController(t)
+	subscribedWithin(t, fc, stalled.URL+","+fc.URL())
+}
+
+func TestClient_SubscribeFollowsRedirectWhoseBodyStalls(t *testing.T) {
+	fc := newFakeController(t)
+	stalled := newBodyStalled(t, http.StatusTemporaryRedirect, fc.URL()+schedulerPath)
+	subscribedWithin(t, fc, stalled.URL)
+}
