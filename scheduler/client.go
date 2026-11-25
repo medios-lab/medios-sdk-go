@@ -403,6 +403,13 @@ func (c *Client) Subscribe(ctx context.Context) (<-chan medios.Event, <-chan err
 // Subscribe can still try the next controller. On a 200 the hop's context
 // lives until the response body is closed.
 func (c *Client) subscribeFollowing(ctx context.Context, endpoint string, body []byte) (*http.Response, error) {
+	// A copy, so a client given through WithHTTPClient keeps its transport
+	// and its own redirect policy for the caller's other uses, while the
+	// hops here are never followed inside Do.
+	httpClient := *c.httpClient
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
 	for hop := 0; hop <= maxRedirects; hop++ {
 		hopCtx, cancel := context.WithCancel(ctx)
 		req, err := http.NewRequestWithContext(hopCtx, http.MethodPost, endpoint, bytes.NewReader(body))
@@ -417,7 +424,7 @@ func (c *Client) subscribeFollowing(ctx context.Context, endpoint string, body [
 		}
 
 		timer := time.AfterFunc(c.handshakeTimeout, cancel)
-		resp, err := c.httpClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if timedOut := !timer.Stop(); timedOut && ctx.Err() == nil {
 			if err == nil {
 				_ = resp.Body.Close()

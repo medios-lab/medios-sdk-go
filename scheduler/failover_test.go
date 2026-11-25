@@ -254,3 +254,22 @@ func TestClient_SubscribeFollowsRedirectWhoseBodyStalls(t *testing.T) {
 	stalled := newBodyStalled(t, http.StatusTemporaryRedirect, fc.URL()+schedulerPath)
 	subscribedWithin(t, fc, stalled.URL)
 }
+
+// A caller's own http.Client follows redirects by default; Subscribe must
+// still handle each hop itself.
+func TestClient_SubscribeFollowsRedirectItselfWithInjectedHTTPClient(t *testing.T) {
+	fc := newFakeController(t)
+	stalled := newBodyStalled(t, http.StatusTemporaryRedirect, fc.URL()+schedulerPath)
+	client, err := NewClient(stalled.URL, "test-fw", WithHTTPClient(&http.Client{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.handshakeTimeout = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	events, _, err := client.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	subscribed(t, fc, events, "fw-001")
+}
