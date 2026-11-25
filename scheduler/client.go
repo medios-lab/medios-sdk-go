@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/user"
+	"strings"
 	"sync"
 
 	"github.com/medios-lab/medios-sdk-go/medios"
@@ -31,7 +32,16 @@ import (
 //  4. medios.Call Teardown when finished.
 //
 // Concurrency: Accept / Decline / Kill / Acknowledge / Teardown are safe
-// from any goroutine. Subscribe is not, call it once at the start.
+// from any goroutine. Subscribe is not: call it at the start, and again only
+// after the previous stream has ended.
+//
+// Controller failover: pass every controller's URL as one comma-separated
+// string. Subscribe finds the leader: it follows a standby's 307 redirect,
+// and moves to the next URL when a controller is unreachable or has no
+// leader yet (HTTP 503). When the stream ends because the leader went away,
+// call Subscribe again on the same client; it resubscribes under the
+// framework_id it was assigned, so with WithFailoverTimeout the framework's
+// tasks keep running.
 //
 // Defaults baked in (required by the Medios HTTP v1 scheduler API; see
 // medios docs/scheduler-http-api.md):
@@ -40,19 +50,28 @@ import (
 //     set defensively.
 //   - Medios-Stream-Id header threaded on every non-SUBSCRIBE call.
 type Client struct {
-	controllerURL string // e.g. "http://127.0.0.1:5050"
-	frameworkInfo medios.FrameworkInfo
-	httpClient    *http.Client
-	principal     string   // asserted in X-Medios-Principal on every call when non-empty
-	role          string   // FrameworkInfo.role; empty means the default role
-	roles         []string // FrameworkInfo.roles; set only through WithRoles
-	rolesSet      bool     // WithRoles was given, even with no roles
-	optErr        error    // first invalid option value; NewClient returns it
+	controllerURLs []string // in the order Subscribe tries them
+	frameworkInfo  medios.FrameworkInfo
+	httpClient     *http.Client
+	principal      string   // asserted in X-Medios-Principal on every call when non-empty
+	role           string   // FrameworkInfo.role; empty means the default role
+	roles          []string // FrameworkInfo.roles; set only through WithRoles
+	rolesSet       bool     // WithRoles was given, even with no roles
+	optErr         error    // first invalid option value; NewClient returns it
 
 	mu          sync.RWMutex
 	frameworkID string // populated from SUBSCRIBED event
 	streamID    string // from SUBSCRIBE response Medios-Stream-Id header
+	endpoint    string // scheduler URL of the controller the stream is open on
 }
+
+const schedulerPath = "/api/v1/scheduler"
+
+// maxRedirects is a parameter: redirects followed from one configured URL. A
+// standby points straight at the leader, so one hop is normal; more means
+// leadership is moving, and Subscribe moves on to the next URL instead of
+// chasing it.
+const maxRedirects = 3
 
 // ClientOption configures a Client at construction.
 type ClientOption func(*Client)
@@ -205,7 +224,8 @@ func validateWebUIURL(rawURL string) error {
 
 // NewClient builds a scheduler client.
 //
-// controllerURL is the Medios controller, e.g. "http://127.0.0.1:5050".
+// controllerURL is the Medios controller, e.g. "http://127.0.0.1:5050", or
+// several controllers separated by commas (see Client: controller failover).
 // frameworkName is the human-readable name reported in medios.FrameworkInfo.
 //
 // The framework's OS user defaults to the current user (required by the
@@ -217,9 +237,18 @@ func NewClient(controllerURL, frameworkName string, opts ...ClientOption) (*Clie
 	if err != nil {
 		return nil, fmt.Errorf("scheduler: cannot resolve current user: %w", err)
 	}
+	var urls []string
+	for _, u := range strings.Split(controllerURL, ",") {
+		if u = strings.TrimRight(strings.TrimSpace(u), "/"); u != "" {
+			urls = append(urls, u)
+		}
+	}
+	if len(urls) == 0 {
+		return nil, errors.New("scheduler: controllerURL: at least one controller URL is required")
+	}
 	hostname, _ := os.Hostname()
 	c := &Client{
-		controllerURL: controllerURL,
+		controllerURLs: urls,
 		frameworkInfo: medios.FrameworkInfo{
 			User:     u.Username,
 			Name:     frameworkName,
@@ -228,6 +257,12 @@ func NewClient(controllerURL, frameworkName string, opts ...ClientOption) (*Clie
 		httpClient: &http.Client{
 			// No global timeout, SUBSCRIBE is long-lived. The non-stream
 			// calls get their context's deadline (or none).
+			//
+			// Redirects are not followed here: Subscribe follows a standby's
+			// 307 itself, so it can bound the hops and record the leader.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 	for _, opt := range opts {
@@ -296,54 +331,94 @@ func (c *Client) FrameworkID() string {
 // from it before delivering, so a consumer reading the channel can issue
 // follow-up calls (Accept, Decline) immediately when OFFERS arrives.
 //
-// A SUBSCRIBE the controller answers with any status other than 200 returns a
-// *CallError, so Rejected reports a 4xx refusal.
+// Controllers are tried in the order given. A 307 from a standby is followed
+// to the leader; an unreachable controller or a 503 (no leader elected yet)
+// moves on to the next URL. Any other status returns a *CallError at once, so
+// Rejected reports a 4xx refusal. When no controller accepts, the returned
+// error wraps what each one answered; the caller decides when to try again.
 //
 // Errors that terminate the stream are exposed via the second return
 // channel; it sends at most one error and is closed alongside the events
 // channel.
 func (c *Client) Subscribe(ctx context.Context) (<-chan medios.Event, <-chan error, error) {
+	c.mu.RLock()
 	call := medios.NewSubscribeCall(c.frameworkInfo)
+	c.mu.RUnlock()
 	body, err := json.Marshal(call)
 	if err != nil {
 		return nil, nil, fmt.Errorf("scheduler: marshal SUBSCRIBE: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.controllerURL+"/api/v1/scheduler", bytes.NewReader(body))
-	if err != nil {
-		return nil, nil, fmt.Errorf("scheduler: build SUBSCRIBE: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	if c.principal != "" {
-		req.Header.Set("X-Medios-Principal", c.principal)
-	}
+	var failures []error
+	for _, base := range c.controllerURLs {
+		endpoint := base + schedulerPath
+		resp, err := c.subscribeFollowing(ctx, endpoint, body)
+		if err != nil {
+			var ce *CallError
+			if errors.As(err, &ce) && ce.StatusCode != http.StatusServiceUnavailable {
+				return nil, nil, err
+			}
+			if ctx.Err() != nil {
+				return nil, nil, fmt.Errorf("scheduler: SUBSCRIBE request: %w", err)
+			}
+			failures = append(failures, err)
+			continue
+		}
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, nil, fmt.Errorf("scheduler: SUBSCRIBE request: %w", err)
+		c.mu.Lock()
+		c.streamID = resp.Header.Get("Medios-Stream-Id")
+		c.endpoint = resp.Request.URL.String()
+		c.mu.Unlock()
+
+		events := make(chan medios.Event, 16)
+		errs := make(chan error, 1)
+		go c.pumpStream(ctx, resp, events, errs)
+		return events, errs, nil
 	}
-	if resp.StatusCode != http.StatusOK {
+	return nil, nil, fmt.Errorf("scheduler: SUBSCRIBE: no controller accepted: %w", errors.Join(failures...))
+}
+
+// subscribeFollowing sends SUBSCRIBE to endpoint, following up to
+// maxRedirects 307s. It returns the open 200 response, a *CallError for any
+// other status, or the transport error, each prefixed with the URL tried.
+func (c *Client) subscribeFollowing(ctx context.Context, endpoint string, body []byte) (*http.Response, error) {
+	for hop := 0; hop <= maxRedirects; hop++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("scheduler: build SUBSCRIBE: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		if c.principal != "" {
+			req.Header.Set("X-Medios-Principal", c.principal)
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", endpoint, err)
+		}
+		if resp.StatusCode == http.StatusOK {
+			return resp, nil
+		}
 		b, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+		if loc := resp.Header.Get("Location"); resp.StatusCode == http.StatusTemporaryRedirect && loc != "" {
+			next, err := resp.Request.URL.Parse(loc)
+			if err != nil {
+				return nil, fmt.Errorf("%s: bad redirect Location %q: %w", endpoint, loc, err)
+			}
+			endpoint = next.String()
+			continue
+		}
 		// Typed, so a caller can tell a refusal (Rejected) from a failure
 		// worth retrying.
-		return nil, nil, &CallError{
+		return nil, &CallError{
 			Call:       string(medios.CallSubscribe),
 			StatusCode: resp.StatusCode,
 			Body:       string(bytes.TrimSpace(b)),
 		}
 	}
-
-	c.mu.Lock()
-	c.streamID = resp.Header.Get("Medios-Stream-Id")
-	c.mu.Unlock()
-
-	events := make(chan medios.Event, 16)
-	errs := make(chan error, 1)
-	go c.pumpStream(ctx, resp, events, errs)
-	return events, errs, nil
+	return nil, fmt.Errorf("%s: more than %d redirects", endpoint, maxRedirects)
 }
 
 // pumpStream reads RecordIO records from resp.Body, decodes each as an
@@ -361,6 +436,8 @@ func (c *Client) pumpStream(ctx context.Context, resp *http.Response, events cha
 			if ev.Type == medios.EventSubscribed && ev.Subscribed != nil {
 				c.mu.Lock()
 				c.frameworkID = ev.Subscribed.FrameworkID.Value
+				// A later Subscribe is a failover of this framework.
+				c.frameworkInfo.ID = &medios.ID{Value: c.frameworkID}
 				c.mu.Unlock()
 			}
 			select {
@@ -449,7 +526,7 @@ func (c *Client) Teardown(ctx context.Context) error {
 // by the Medios HTTP v1 scheduler API) and reports any non-2xx with the body.
 func (c *Client) post(ctx context.Context, call medios.Call) error {
 	c.mu.RLock()
-	streamID := c.streamID
+	streamID, endpoint := c.streamID, c.endpoint
 	c.mu.RUnlock()
 	if streamID == "" {
 		return errors.New("scheduler: no Medios-Stream-Id (call Subscribe first)")
@@ -459,8 +536,7 @@ func (c *Client) post(ctx context.Context, call medios.Call) error {
 	if err != nil {
 		return fmt.Errorf("scheduler: marshal %s: %w", call.Type, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.controllerURL+"/api/v1/scheduler", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("scheduler: build %s: %w", call.Type, err)
 	}
