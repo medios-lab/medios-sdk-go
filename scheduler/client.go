@@ -14,6 +14,7 @@ import (
 	"os/user"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/medios-lab/medios-sdk-go/medios"
 )
@@ -59,6 +60,10 @@ type Client struct {
 	rolesSet       bool     // WithRoles was given, even with no roles
 	optErr         error    // first invalid option value; NewClient returns it
 
+	// handshakeTimeout bounds one SUBSCRIBE attempt, from dialing to the
+	// response headers. It does not bound the open stream.
+	handshakeTimeout time.Duration
+
 	mu          sync.RWMutex
 	frameworkID string // populated from SUBSCRIBED event
 	streamID    string // from SUBSCRIBE response Medios-Stream-Id header
@@ -72,6 +77,14 @@ const schedulerPath = "/api/v1/scheduler"
 // leadership is moving, and Subscribe moves on to the next URL instead of
 // chasing it.
 const maxRedirects = 3
+
+// defaultHandshakeTimeout is a default: how long one SUBSCRIBE attempt may
+// take from dialing to the response headers before Subscribe moves on to the
+// next controller. A controller answers SUBSCRIBE with its headers as soon as
+// it has read the call, so a healthy one needs a network round trip; ten
+// seconds leaves room for a slow link and has not been measured against a
+// loaded controller.
+const defaultHandshakeTimeout = 10 * time.Second
 
 // ClientOption configures a Client at construction.
 type ClientOption func(*Client)
@@ -248,7 +261,8 @@ func NewClient(controllerURL, frameworkName string, opts ...ClientOption) (*Clie
 	}
 	hostname, _ := os.Hostname()
 	c := &Client{
-		controllerURLs: urls,
+		controllerURLs:   urls,
+		handshakeTimeout: defaultHandshakeTimeout,
 		frameworkInfo: medios.FrameworkInfo{
 			User:     u.Username,
 			Name:     frameworkName,
@@ -332,8 +346,9 @@ func (c *Client) FrameworkID() string {
 // follow-up calls (Accept, Decline) immediately when OFFERS arrives.
 //
 // Controllers are tried in the order given. A 307 from a standby is followed
-// to the leader; an unreachable controller or a 503 (no leader elected yet)
-// moves on to the next URL. Any other status returns a *CallError at once, so
+// to the leader; an unreachable controller, one that sends no response
+// headers within ten seconds, or a 503 (no leader elected yet) moves on to
+// the next URL. Any other status returns a *CallError at once, so
 // Rejected reports a 4xx refusal. When no controller accepts, the returned
 // error wraps what each one answered; the caller decides when to try again.
 //
@@ -381,10 +396,17 @@ func (c *Client) Subscribe(ctx context.Context) (<-chan medios.Event, <-chan err
 // subscribeFollowing sends SUBSCRIBE to endpoint, following up to
 // maxRedirects 307s. It returns the open 200 response, a *CallError for any
 // other status, or the transport error, each prefixed with the URL tried.
+//
+// Each hop gets its own context, cancelled when handshakeTimeout passes
+// before the response headers arrive. The caller's context is left alone, so
+// Subscribe can still try the next controller. On a 200 the hop's context
+// lives until the response body is closed.
 func (c *Client) subscribeFollowing(ctx context.Context, endpoint string, body []byte) (*http.Response, error) {
 	for hop := 0; hop <= maxRedirects; hop++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		hopCtx, cancel := context.WithCancel(ctx)
+		req, err := http.NewRequestWithContext(hopCtx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
+			cancel()
 			return nil, fmt.Errorf("scheduler: build SUBSCRIBE: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -393,15 +415,25 @@ func (c *Client) subscribeFollowing(ctx context.Context, endpoint string, body [
 			req.Header.Set("X-Medios-Principal", c.principal)
 		}
 
+		timer := time.AfterFunc(c.handshakeTimeout, cancel)
 		resp, err := c.httpClient.Do(req)
+		if timedOut := !timer.Stop(); timedOut && ctx.Err() == nil {
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+			return nil, fmt.Errorf("%s: no response headers within %s", endpoint, c.handshakeTimeout)
+		}
 		if err != nil {
+			cancel()
 			return nil, fmt.Errorf("%s: %w", endpoint, err)
 		}
 		if resp.StatusCode == http.StatusOK {
+			resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
 			return resp, nil
 		}
 		b, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
+		cancel()
 		if loc := resp.Header.Get("Location"); resp.StatusCode == http.StatusTemporaryRedirect && loc != "" {
 			next, err := resp.Request.URL.Parse(loc)
 			if err != nil {
@@ -419,6 +451,19 @@ func (c *Client) subscribeFollowing(ctx context.Context, endpoint string, body [
 		}
 	}
 	return nil, fmt.Errorf("%s: more than %d redirects", endpoint, maxRedirects)
+}
+
+// cancelOnClose releases a response's request context when its body is
+// closed.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnClose) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 // pumpStream reads RecordIO records from resp.Body, decodes each as an

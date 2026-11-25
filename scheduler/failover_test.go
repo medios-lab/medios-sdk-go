@@ -146,3 +146,59 @@ func TestNewClient_RefusesEmptyControllerURL(t *testing.T) {
 		t.Fatal("NewClient accepted an empty controller URL")
 	}
 }
+
+// newStalled is a controller that accepts the connection and never answers.
+func newStalled(t *testing.T) *httptest.Server {
+	release := make(chan struct{})
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		s.Close()
+	})
+	return s
+}
+
+func TestClient_SubscribeSkipsControllerThatNeverAnswers(t *testing.T) {
+	stalled := newStalled(t)
+	fc := newFakeController(t)
+	client, err := NewClient(stalled.URL+","+fc.URL(), "test-fw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.handshakeTimeout = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	events, _, err := client.Subscribe(ctx)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	// The stream outlives the handshake bound.
+	time.Sleep(2 * client.handshakeTimeout)
+	subscribed(t, fc, events, "fw-001")
+}
+
+func TestClient_SubscribeNamesControllerThatNeverAnswers(t *testing.T) {
+	stalled := newStalled(t)
+	client, err := NewClient(stalled.URL, "test-fw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.handshakeTimeout = 200 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err = client.Subscribe(ctx)
+	if err == nil {
+		t.Fatal("Subscribe succeeded against a controller that never answers")
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("Subscribe used up the caller's deadline: %v", err)
+	}
+	if !strings.Contains(err.Error(), stalled.URL) || !strings.Contains(err.Error(), "no response headers") {
+		t.Fatalf("error does not name the stalled controller: %v", err)
+	}
+}
